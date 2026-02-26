@@ -1,26 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:latest AS builder
-ARG TARGETARCH
+FROM rust:alpine AS builder
 WORKDIR /app
+
+RUN apk add --no-cache build-base musl-dev openssl-dev pkgconfig perl
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) rust_target="x86_64-unknown-linux-musl" ;; \
-      arm64) rust_target="aarch64-unknown-linux-musl" ;; \
-      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
-    esac; \
-    rustup target add "${rust_target}"; \
-    cargo build --release --target "${rust_target}"; \
-    cp "target/${rust_target}/release/katai_link" /tmp/katai_link
+RUN cargo build --release \
+    && cp target/release/katai_link /tmp/katai_link
 
 FROM alpine:3.21 AS runtime
 ARG TARGETARCH
 ARG CODEX_VERSION=latest
 
-RUN apk add --no-cache ca-certificates curl tar
+RUN apk add --no-cache ca-certificates curl tar openssl
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
@@ -45,6 +39,7 @@ RUN set -eux; \
 COPY --from=builder /tmp/katai_link /usr/local/bin/katai_link
 
 WORKDIR /app
+COPY config.yaml /app/config.yaml
 
 ENV RUST_LOG=info
 
