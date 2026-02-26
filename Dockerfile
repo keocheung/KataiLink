@@ -34,9 +34,13 @@ RUN set -eux; \
       codex_url="https://github.com/openai/codex/releases/download/${CODEX_VERSION}/codex-${codex_arch}.tar.gz"; \
     fi; \
     curl -fsSL "${codex_url}" -o /tmp/codex.tar.gz; \
-    tar -xzf /tmp/codex.tar.gz -C /usr/local/bin codex; \
+    tmp_dir="$(mktemp -d)"; \
+    tar -xzf /tmp/codex.tar.gz -C "${tmp_dir}"; \
+    codex_bin="$(find "${tmp_dir}" -type f -name 'codex*' | head -n 1)"; \
+    test -n "${codex_bin}"; \
+    cp "${codex_bin}" /usr/local/bin/codex; \
     chmod +x /usr/local/bin/codex; \
-    rm -f /tmp/codex.tar.gz
+    rm -rf "${tmp_dir}" /tmp/codex.tar.gz
 
 COPY --from=builder /tmp/katai_link /usr/local/bin/katai_link
 
