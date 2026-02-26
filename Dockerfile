@@ -41,7 +41,6 @@ RUN set -eux; \
 COPY --from=builder /tmp/katai_link /usr/local/bin/katai_link
 
 WORKDIR /app
-COPY config.yaml /app/config.yaml
 
 ENV RUST_LOG=info
 
