@@ -1,0 +1,47 @@
+name: pr-check
+
+on:
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo check
+        run: cargo check --all-targets
+
+      - name: Cargo test
+        run: cargo test --all-targets
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number || github.run_number }}
+
+      - name: Build Docker image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
