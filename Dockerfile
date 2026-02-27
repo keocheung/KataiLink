@@ -11,17 +11,12 @@ RUN cargo build --release \
     && cp target/release/katai_link /tmp/katai_link
 
 FROM alpine:3.21 AS runtime
-ARG TARGETARCH
 ARG CODEX_VERSION=latest
 
 RUN apk add --no-cache ca-certificates curl tar openssl
 
 RUN set -eux; \
-    case "${TARGETARCH}" in \
-      amd64) codex_arch="x86_64-unknown-linux-musl" ;; \
-      arm64) codex_arch="aarch64-unknown-linux-musl" ;; \
-      *) echo "Unsupported TARGETARCH: ${TARGETARCH}"; exit 1 ;; \
-    esac; \
+    codex_arch="x86_64-unknown-linux-musl"; \
     if [ "${CODEX_VERSION}" = "latest" ]; then \
       codex_url="https://github.com/openai/codex/releases/latest/download/codex-${codex_arch}.tar.gz"; \
     else \
