@@ -41,6 +41,9 @@ jobs:
           tags: |
             type=raw,value=main
 
+      - name: Set up Rust cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
