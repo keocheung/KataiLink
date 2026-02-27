@@ -3,7 +3,7 @@
 FROM rust:alpine AS builder
 WORKDIR /app
 
-RUN apk add --no-cache build-base musl-dev openssl-dev pkgconfig perl
+RUN apk add --no-cache build-base musl-dev openssl-dev openssl-libs-static pkgconfig perl
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
