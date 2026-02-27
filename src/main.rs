@@ -1,3 +1,7 @@
+mod config;
+mod model;
+mod provider;
+
 use std::{
     collections::HashMap,
     env,
@@ -12,53 +16,23 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::Deserialize;
 use teloxide::{
     dispatching::Dispatcher,
     dptree,
-    prelude::*,
     payloads::SendMessageSetters,
+    prelude::*,
     types::{InlineKeyboardButton, InlineKeyboardMarkup},
 };
 use tokio::{
-    process::Command,
     sync::{Mutex, mpsc},
     time::sleep,
 };
 
-#[derive(Debug, Deserialize, Clone)]
-struct Config {
-    ai_provider: String,
-    prompt: String,
-    tasks: Vec<TaskConfig>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct TaskConfig {
-    watch_path: PathBuf,
-    dest_path: PathBuf,
-    #[serde(default = "default_confirm")]
-    confirm: bool,
-}
-
-fn default_confirm() -> bool {
-    true
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct MediaInfo {
-    original_name: String,
-    year: i32,
-    tmdb_id: i64,
-    season: Option<u32>,
-    episode: Option<u32>,
-}
-
-impl MediaInfo {
-    fn is_tv(&self) -> bool {
-        self.season.is_some() && self.episode.is_some()
-    }
-}
+use crate::{
+    config::{Config, TaskConfig, load_config},
+    model::MediaInfo,
+    provider::{AiProvider, build_ai_provider},
+};
 
 #[derive(Debug, Clone)]
 struct LinkOperation {
@@ -82,6 +56,7 @@ struct FileEvent {
 
 struct AppState {
     config: Config,
+    ai_provider: Arc<dyn AiProvider>,
     allowed_chat_id: ChatId,
     pending_jobs: Mutex<HashMap<u64, PendingJob>>,
     id_seq: AtomicU64,
@@ -91,18 +66,9 @@ struct AppState {
 async fn main() -> Result<()> {
     init_logger();
 
-    let config_path = env::var("KATAILINK_CONFIG").unwrap_or_else(|_| "config.yaml".to_string());
-    let config_text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("无法读取配置文件: {config_path}"))?;
-    let config: Config = serde_yaml::from_str(&config_text)
-        .with_context(|| format!("配置文件 YAML 解析失败: {config_path}"))?;
+    let config = load_config()?;
 
-    if config.ai_provider.trim() != "codex-cli" {
-        bail!(
-            "暂不支持 ai_provider={}, 当前只支持 codex-cli",
-            config.ai_provider
-        );
-    }
+    let ai_provider = build_ai_provider(&config.ai_provider)?;
 
     let chat_id_raw = env::var("KATAILINK_CHAT_ID")
         .context("缺少环境变量 KATAILINK_CHAT_ID（仅允许这个 chat id 与机器人交互）")?;
@@ -132,6 +98,7 @@ async fn main() -> Result<()> {
     let bot = Bot::from_env();
     let state = Arc::new(AppState {
         config,
+        ai_provider,
         allowed_chat_id,
         pending_jobs: Mutex::new(HashMap::new()),
         id_seq: AtomicU64::new(1),
@@ -266,7 +233,9 @@ async fn process_file_event(bot: &Bot, state: &Arc<AppState>, event: FileEvent) 
         event.path.display()
     );
 
-    let media = identify_with_codex_cli(&state.config.prompt, file_name)
+    let media = state
+        .ai_provider
+        .identify(&state.config.prompt, file_name)
         .await
         .with_context(|| format!("AI 识别失败: {file_name}"))?;
 
@@ -425,72 +394,6 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>)
     Ok(())
 }
 
-async fn identify_with_codex_cli(prompt: &str, file_name: &str) -> Result<MediaInfo> {
-    const MAX_ATTEMPTS: usize = 3;
-    let final_prompt = format!(
-        "{prompt}\n\n文件名: {file_name}\n\n严格只输出 JSON，对象字段为 original_name, year, tmdb_id, season, episode。"
-    );
-
-    let mut last_err: Option<anyhow::Error> = None;
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        let output = Command::new("codex")
-            .arg("exec")
-            .arg(&final_prompt)
-            .output()
-            .await
-            .context("调用 codex CLI 失败")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("codex CLI 返回非 0 状态: {}", stderr.trim());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        match parse_media_info_from_output(&stdout) {
-            Ok(parsed) => return Ok(parsed),
-            Err(err) => {
-                log::warn!(
-                    "AI 输出格式错误，准备重试: attempt={}/{} file={} err={:#}",
-                    attempt,
-                    MAX_ATTEMPTS,
-                    file_name,
-                    err
-                );
-                last_err = Some(err);
-                if attempt < MAX_ATTEMPTS {
-                    sleep(Duration::from_millis(300)).await;
-                }
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| anyhow!("AI 识别失败且未返回可解析结果")))
-}
-
-fn parse_media_info_from_output(stdout: &str) -> Result<MediaInfo> {
-    let json_str = extract_json_object(stdout)
-        .ok_or_else(|| anyhow!("codex 输出不含 JSON 对象: {}", stdout.trim()))?;
-
-    let parsed: MediaInfo =
-        serde_json::from_str(json_str).with_context(|| format!("JSON 解析失败: {}", json_str))?;
-
-    if parsed.original_name.trim().is_empty() {
-        bail!("识别结果 original_name 为空");
-    }
-
-    Ok(parsed)
-}
-
-fn extract_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    Some(&text[start..=end])
-}
-
 fn build_link_operations(
     task: &TaskConfig,
     source_video: &Path,
@@ -512,7 +415,11 @@ fn build_link_operations(
             format!("{} - S{:02}E{:02}", safe_title, season, episode),
         )
     } else {
-        (format!("{} ({})", safe_title, media.year), None, safe_title.to_string())
+        (
+            format!("{} ({})", safe_title, media.year),
+            None,
+            safe_title.to_string(),
+        )
     };
 
     let mut target_dir = task.dest_path.join(container_dir);
@@ -687,7 +594,11 @@ fn render_pending_summary(
     lines.push(format!("操作数: {}", operations.len()));
 
     for op in operations {
-        lines.push(format!("{} -> {}", op.source.display(), op.target.display()));
+        lines.push(format!(
+            "{} -> {}",
+            op.source.display(),
+            op.target.display()
+        ));
     }
 
     lines.join("\n")
