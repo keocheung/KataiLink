@@ -21,12 +21,15 @@ use teloxide::{
     dptree,
     payloads::SendMessageSetters,
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup},
+    requests::Requester,
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MessageId},
 };
 use tokio::{
+    process::Command,
     sync::{Mutex, mpsc},
     time::sleep,
 };
+use url::Url;
 
 use crate::{
     config::{Config, TaskConfig, load_config},
@@ -60,6 +63,7 @@ struct AppState {
     allowed_chat_id: ChatId,
     pending_jobs: Mutex<HashMap<u64, PendingJob>>,
     id_seq: AtomicU64,
+    tmdb_api_key: Option<String>,
 }
 
 #[tokio::main]
@@ -96,12 +100,17 @@ async fn main() -> Result<()> {
     }
 
     let bot = Bot::from_env();
+    let tmdb_api_key = env::var("TMDB_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
     let state = Arc::new(AppState {
         config,
         ai_provider,
         allowed_chat_id,
         pending_jobs: Mutex::new(HashMap::new()),
         id_seq: AtomicU64::new(1),
+        tmdb_api_key,
     });
 
     let (tx, rx) = mpsc::unbounded_channel::<FileEvent>();
@@ -271,10 +280,26 @@ async fn process_file_event(bot: &Bot, state: &Arc<AppState>, event: FileEvent) 
             InlineKeyboardButton::callback("取消", format!("reject:{request_id}")),
         ]]);
 
-        bot.send_message(state.allowed_chat_id, summary)
-            .reply_markup(keyboard)
-            .await
-            .context("发送确认消息失败")?;
+        if let Some(cover_url) = fetch_tmdb_cover_url(&state, &media).await {
+            let cover_url = Url::parse(&cover_url).ok();
+            if let Some(cover_url) = cover_url {
+                bot.send_photo(state.allowed_chat_id, InputFile::url(cover_url))
+                    .caption(summary)
+                    .reply_markup(keyboard)
+                    .await
+                    .context("发送带封面确认消息失败")?;
+            } else {
+                bot.send_message(state.allowed_chat_id, summary.clone())
+                    .reply_markup(keyboard.clone())
+                    .await
+                    .context("封面 URL 无效，回退发送确认消息失败")?;
+            }
+        } else {
+            bot.send_message(state.allowed_chat_id, summary)
+                .reply_markup(keyboard)
+                .await
+                .context("发送确认消息失败")?;
+        }
 
         log::info!("已发送确认请求: id={request_id}");
         return Ok(());
@@ -350,6 +375,17 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>)
             let result = execute_link_operations(&job.operations);
             match result {
                 Ok(()) => {
+                    if let Err(err) = update_callback_buttons(
+                        &bot,
+                        message.chat().id,
+                        message.id(),
+                        request_id,
+                        "✅ 已确认执行",
+                    )
+                    .await
+                    {
+                        log::warn!("更新确认按钮状态失败: {err:#}");
+                    }
                     bot.answer_callback_query(q.id).text("已执行").await?;
                     bot.send_message(
                         state.allowed_chat_id,
@@ -370,6 +406,17 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>)
             }
         }
         ("reject", Some(job)) => {
+            if let Err(err) = update_callback_buttons(
+                &bot,
+                message.chat().id,
+                message.id(),
+                request_id,
+                "❌ 已取消",
+            )
+            .await
+            {
+                log::warn!("更新取消按钮状态失败: {err:#}");
+            }
             bot.answer_callback_query(q.id).text("已取消").await?;
             bot.send_message(
                 state.allowed_chat_id,
@@ -381,6 +428,9 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>)
             )
             .await?;
         }
+        ("done", _) => {
+            bot.answer_callback_query(q.id).text("该任务已处理").await?;
+        }
         (_, None) => {
             bot.answer_callback_query(q.id)
                 .text("任务不存在或已处理")
@@ -390,6 +440,66 @@ async fn handle_callback_query(bot: Bot, q: CallbackQuery, state: Arc<AppState>)
             bot.answer_callback_query(q.id).text("未知操作").await?;
         }
     }
+
+    Ok(())
+}
+
+async fn fetch_tmdb_cover_url(state: &AppState, media: &MediaInfo) -> Option<String> {
+    let api_key = state.tmdb_api_key.as_ref()?;
+    let media_type = if media.is_tv() { "tv" } else { "movie" };
+    let endpoint = format!(
+        "https://api.themoviedb.org/3/{media_type}/{}?api_key={api_key}&language=zh-CN",
+        media.tmdb_id
+    );
+
+    let output = match Command::new("curl")
+        .arg("-fsSL")
+        .arg(endpoint)
+        .output()
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            log::warn!("调用 curl 请求 TMDB 失败: {err}");
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        log::warn!("TMDB 请求失败，curl exit code: {:?}", output.status.code());
+        return None;
+    }
+
+    let json: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(err) => {
+            log::warn!("解析 TMDB 返回失败: {err}");
+            return None;
+        }
+    };
+
+    let Some(poster_path) = json.get("poster_path").and_then(|v| v.as_str()) else {
+        return None;
+    };
+
+    Some(format!("https://image.tmdb.org/t/p/w500{poster_path}"))
+}
+
+async fn update_callback_buttons(
+    bot: &Bot,
+    chat_id: ChatId,
+    message_id: MessageId,
+    request_id: u64,
+    label: &str,
+) -> Result<()> {
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+        label.to_string(),
+        format!("done:{request_id}"),
+    )]]);
+
+    bot.edit_message_reply_markup(chat_id, message_id)
+        .reply_markup(keyboard)
+        .await?;
 
     Ok(())
 }
